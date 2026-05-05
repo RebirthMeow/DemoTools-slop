@@ -3,16 +3,6 @@ AI generated readme below
 
 ## Per-frag feature categories
 
-Each entry in `ownfrags` / `frags`:
-
-**Identity & timing** — `attacker`, `target`, `mod_name`, `time_raw`, `human_time`, `map_start_time_raw`. `time_raw` is ms since the demo started recording (includes warmup); `human_time` is match-time as a string (post-warmup). Both are present so consumers pick the timeline they want.
-
-**View angles** — `view_delta_deg`, `view_speed_deg_per_ms`, `view_best_delta_deg`, `view_best_speed_deg_per_sec`. The standard "did the attacker actually aim into this kill" signal.
-
-**Motion** — `attacker_target_distance`, `attacker_xy_speed`, `attacker_z_speed`, `target_xy_speed`, `target_z_speed`, `attacker_distance_last_second`, `target_distance_last_second`. Distance, lateral / vertical speed, and how much each player has moved in the trailing second.
-
-**Projectile** — `missile_lifetime`, `missile_pitch`. Separates direct hits from arcing rockets / charged pistol shots.
-
 **Mid-air & target state** *(added v11)* — `target_airborne`, `victim_airtime_ms`, `target_z_phase` (`ascending`/`apex`/`falling`/`ground`), `vertical_delta`, `target_crossing_dot`, `target_lead_distance`, `target_dir_changes_during_flight`, `target_air_cause` (`jumppad`/`explosion`/`jump`/`fall`/`teleport`/`unknown`).
 
 **View-flick window** *(added v12)* — `view_flick_window_deg`, `view_flick_window_ms`, `view_flick_window_speed_deg_per_sec`, `view_flick_align_ms`. A windowed search around the kill (and the projectile-fire moment for missile weapons) for the largest sustained angular swing.
