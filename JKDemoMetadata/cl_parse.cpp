@@ -3,6 +3,12 @@
 #include "qcommon/qcommon.h"
 #include "client/client.h"
 #include "demo_common.h"
+#include "snapshot_ring.h"
+#include <cstdio>
+#include <algorithm>
+std::deque<SnapLite> g_snapHist[MAX_CLIENTS];
+
+clientActive_t cl = {};      // ← restore the global instance exactly once
 
 extern	cvar_t	*cl_shownet;
 
@@ -500,13 +506,18 @@ void CL_ParseServerMessage( msg_t *msg ) {
 			break;
 		case svc_serverCommand:
 			CL_ParseCommandString( msg );
+			// (snap-ring push moved to svc_snapshot handler in main.cpp / updateSnapHist —
+			// pushing here was time-irregular and produced duplicates per snap)
 			break;
 		case svc_gamestate:
 			CL_ParseGamestate( msg );
 			break;
 		case svc_snapshot:
-			CL_ParseSnapshot( msg );
+			CL_ParseSnapshot( msg );                     // existing call – keep!
+	
 			break;
+
+
 		case svc_setgame:
 			CL_ParseSetGame( msg );
 			break;

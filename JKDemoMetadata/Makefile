@@ -27,7 +27,11 @@ CC = gcc
 CONFIG = -O3 -DNDEBUG
 #CONFIG = -O0 -g -DNDEBUG
 #CONFIG = -g3 -D_DEBUG
-INCLUDES = -I../OpenJK/codemp -I../OpenJK/shared -I../OpenJK/lib/gsl-lite/include -I../OpenJK/lib/minizip/include
+# Makefile  ── just extend the existing line
+INCLUDES = -I../OpenJK/codemp -I../OpenJK/shared \
+           -I../OpenJK/lib/gsl-lite/include -I../OpenJK/lib/minizip/include
+
+
 DEFINES = -DARCH_STRING=\"arm\" -DDEDICATED -DFINAL_BUILD -D_CONSOLE
 OPTIONS = -std=c++11 -Wall -Wno-invalid-offsetof -Wno-write-strings -Wno-comment -fsigned-char -fvisibility=hidden
 FLAGS = $(INCLUDES) $(DEFINES) $(OPTIONS) $(CONFIG)
@@ -38,11 +42,12 @@ TARGET = jkdemometadata
 
 # Object Files
 OJKSRCS = \
-	codemp/qcommon/huffman.o \
-	codemp/qcommon/msg.o \
-	shared/qcommon/q_math.o \
-	codemp/qcommon/q_shared.o \
-	shared/qcommon/q_string.o
+    codemp/qcommon/huffman.o \
+    codemp/qcommon/msg.o \
+    shared/qcommon/q_math.o \
+    codemp/qcommon/q_shared.o \
+    shared/qcommon/q_string.o 
+
 OJKFILES = $(notdir $(OJKSRCS))
 LOCALFILES = \
 	cl_parse.o \
@@ -55,7 +60,7 @@ FILES = $(OJKFILES) $(LOCALFILES)
 # "make"
 $(TARGET):  $(FILES)
 	$(CC) -o $(TARGET) $(FILES) $(LIBS)
-	chmod +x $(TARGET)
+#	chmod +x $(TARGET)
 
 # "make .c.o"
 .c.o:

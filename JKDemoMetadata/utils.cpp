@@ -1,6 +1,9 @@
 #include <cwchar>   // wchar_t wide characters
 #include "client/client.h"
 #include "demo_common.h"
+#include <map>
+#include <string>
+
 #if (defined _MSC_VER)
 #include <Windows.h>
 
@@ -109,62 +112,112 @@ const char *cp1252toUTF8( const char *cp1252 )
 }
 #endif
 
-const char *getPlayerName( int playerIdx ) {
-	if ( playerIdx > MAX_CLIENTS ) {
-		return "UNKNOWN";
-	}
-	const char *result = Info_ValueForKey( ctx->cl.gameState.stringData + ctx->cl.gameState.stringOffsets[ CS_PLAYERS + playerIdx ], "n" );
-	if ( result ) {
-		return result;
-	}
-	return "UNKNOWN";
-}
-
-const char *getPlayerNameUTF8( int playerIdx ) {
-	return cp1252toUTF8( getPlayerName( playerIdx ) );
-}
-
-int playerSkill( int playerIdx ) {
-	if ( playerIdx > MAX_CLIENTS ) {
-		return -1;
-	}
-	char *skillStr = Info_ValueForKey( ctx->cl.gameState.stringData + ctx->cl.gameState.stringOffsets[ CS_PLAYERS + playerIdx ], "skill" );
-	if ( skillStr && skillStr[0] ) {
-		return atoi( skillStr );
-	} else {
-		return -1;
-	}
-}
-
 #if (defined _MSC_VER)
 #define strtoull _strtoui64
 #endif
 
+typedef struct clientCache_s {
+	int lastOffset;
+	char name[MAX_NETNAME];
+	char nameUTF8[MAX_NETNAME * 3]; // UTF-8 can be up to 3x longer
+	int skill;
+	uint64_t uniqueId;
+	char cid[MAX_STRING_CHARS];
+	team_t team;
+} clientCache_t;
+
+static clientCache_t clientCache[MAX_CLIENTS];
+static bool clientCacheInitialized = false;
+
+static void updateClientCache( int playerIdx ) {
+	if ( !clientCacheInitialized ) {
+		for ( int i = 0; i < MAX_CLIENTS; i++ ) {
+			clientCache[i].lastOffset = -1;
+		}
+		clientCacheInitialized = true;
+	}
+
+	int currentOffset = ctx->cl.gameState.stringOffsets[CS_PLAYERS + playerIdx];
+	if ( clientCache[playerIdx].lastOffset == currentOffset ) {
+		return;
+	}
+
+	const char *cs = ctx->cl.gameState.stringData + currentOffset;
+	if ( !*cs ) {
+		clientCache[playerIdx].lastOffset = currentOffset;
+		clientCache[playerIdx].name[0] = 0;
+		clientCache[playerIdx].nameUTF8[0] = 0;
+		clientCache[playerIdx].skill = -1;
+		clientCache[playerIdx].uniqueId = 0;
+		clientCache[playerIdx].cid[0] = 0;
+		clientCache[playerIdx].team = TEAM_FREE;
+		return;
+	}
+
+	clientCache[playerIdx].lastOffset = currentOffset;
+	
+	const char *n = Info_ValueForKey( cs, "n" );
+	Q_strncpyz( clientCache[playerIdx].name, n ? n : "UNKNOWN", sizeof( clientCache[playerIdx].name ) );
+	Q_strncpyz( clientCache[playerIdx].nameUTF8, cp1252toUTF8( clientCache[playerIdx].name ), sizeof( clientCache[playerIdx].nameUTF8 ) );
+
+	const char *skillStr = Info_ValueForKey( cs, "skill" );
+	clientCache[playerIdx].skill = ( skillStr && skillStr[0] ) ? atoi( skillStr ) : -1;
+
+	const char *idStr = Info_ValueForKey( cs, "id" );
+	if ( idStr && *idStr ) {
+		char *p = NULL;
+		clientCache[playerIdx].uniqueId = strtoull( idStr, &p, 10 );
+		if ( errno == ERANGE || *p != 0 || p == idStr ) {
+			clientCache[playerIdx].uniqueId = 0;
+		}
+	} else {
+		clientCache[playerIdx].uniqueId = 0;
+	}
+
+	const char *cidStr = Info_ValueForKey( cs, "cid" );
+	Q_strncpyz( clientCache[playerIdx].cid, cidStr ? cidStr : "", sizeof( clientCache[playerIdx].cid ) );
+
+	clientCache[playerIdx].team = (team_t) atoi( Info_ValueForKey( cs, "t" ) );
+}
+
+const char *getPlayerName( int playerIdx ) {
+	if ( playerIdx < 0 || playerIdx >= MAX_CLIENTS ) {
+		return "UNKNOWN";
+	}
+	updateClientCache( playerIdx );
+	return clientCache[playerIdx].name;
+}
+
+const char *getPlayerNameUTF8( int playerIdx ) {
+	if ( playerIdx < 0 || playerIdx >= MAX_CLIENTS ) {
+		return "UNKNOWN";
+	}
+	updateClientCache( playerIdx );
+	return clientCache[playerIdx].nameUTF8;
+}
+
+int playerSkill( int playerIdx ) {
+	if ( playerIdx < 0 || playerIdx >= MAX_CLIENTS ) {
+		return -1;
+	}
+	updateClientCache( playerIdx );
+	return clientCache[playerIdx].skill;
+}
+
 uint64_t getUniqueId( int playerIdx ) {
-	if ( playerIdx > MAX_CLIENTS ) {
+	if ( playerIdx < 0 || playerIdx >= MAX_CLIENTS ) {
 		return 0;
 	}
-	const char *result = Info_ValueForKey( ctx->cl.gameState.stringData + ctx->cl.gameState.stringOffsets[ CS_PLAYERS + playerIdx ], "id" );
-	if ( result && *result ) {
-		char *p = NULL;
-		uint64_t uniqueId = strtoull( result, &p, 10 );
-		if ( errno == ERANGE || *p != 0 || p == result ) {
-			return 0;
-		}
-		return uniqueId;
-	}
-	return 0;
+	updateClientCache( playerIdx );
+	return clientCache[playerIdx].uniqueId;
 }
 
 const char* getNewmodId( int playerIdx ) {
-	if ( playerIdx > MAX_CLIENTS ) {
+	if ( playerIdx < 0 || playerIdx >= MAX_CLIENTS ) {
 		return 0;
 	}
-	const char *result = Info_ValueForKey( ctx->cl.gameState.stringData + ctx->cl.gameState.stringOffsets[ CS_PLAYERS + playerIdx ], "cid" );
-	if ( result && *result ) {
-		return result;
-	}
-	return 0;
+	updateClientCache( playerIdx );
+	return clientCache[playerIdx].cid[0] ? clientCache[playerIdx].cid : 0;
 }
 
 const char *CG_TeamName(team_t team)
@@ -187,27 +240,41 @@ team_t OtherTeam(team_t team) {
 }
 
 const char *getPlayerTeamName( int playerIdx ) {
-	if ( playerIdx > MAX_CLIENTS ) {
+	if ( playerIdx < 0 || playerIdx >= MAX_CLIENTS ) {
 		return "UNKNOWN";
 	}
-	return CG_TeamName( (team_t) atoi( Info_ValueForKey( ctx->cl.gameState.stringData + ctx->cl.gameState.stringOffsets[ CS_PLAYERS + playerIdx ], "t" ) ) );
+	updateClientCache( playerIdx );
+	return CG_TeamName( clientCache[playerIdx].team );
 }
 
 qboolean playerActive( int playerIdx ) {
+	if ( playerIdx < 0 || playerIdx >= MAX_CLIENTS ) {
+		return qfalse;
+	}
 	// player's configstring is set to emptystring if they are not connected
 	return *(ctx->cl.gameState.stringData + ctx->cl.gameState.stringOffsets[ CS_PLAYERS + playerIdx ]) != 0 ? qtrue : qfalse;
 }
 
 team_t getPlayerTeam( int playerIdx ) {
-	if ( playerIdx > MAX_CLIENTS ) {
+	if ( playerIdx < 0 || playerIdx >= MAX_CLIENTS ) {
 		return TEAM_FREE;
 	}
-	return (team_t) atoi( Info_ValueForKey( ctx->cl.gameState.stringData + ctx->cl.gameState.stringOffsets[ CS_PLAYERS + playerIdx ], "t" ) );
+	updateClientCache( playerIdx );
+	return clientCache[playerIdx].team;
 }
 
+static gametype_t cachedGameType = (gametype_t)0;
+static int cachedGameTypeOffset = -1;
+
 gametype_t getGameType() {
-	return (gametype_t) atoi( Info_ValueForKey( ctx->cl.gameState.stringData + ctx->cl.gameState.stringOffsets[ CS_SERVERINFO ], "g_gametype" ) );
+	int currentOffset = ctx->cl.gameState.stringOffsets[ CS_SERVERINFO ];
+	if ( currentOffset != cachedGameTypeOffset ) {
+		cachedGameType = (gametype_t) atoi( Info_ValueForKey( ctx->cl.gameState.stringData + currentOffset, "g_gametype" ) );
+		cachedGameTypeOffset = currentOffset;
+	}
+	return cachedGameType;
 }
+
 
 clSnapshot_t *previousSnap() {
 	int curSnap = ctx->cl.snap.messageNum & PACKET_MASK;
@@ -219,6 +286,14 @@ clSnapshot_t *previousSnap() {
 	return NULL;
 }
 
+static int cachedLevelStartTime = 0;
+static int cachedLevelStartTimeOffset = -1;
+
 long getCurrentTime() {
-	return ctx->cl.snap.serverTime - atoi( ctx->cl.gameState.stringData + ctx->cl.gameState.stringOffsets[ CS_LEVEL_START_TIME ] );
+	int currentOffset = ctx->cl.gameState.stringOffsets[ CS_LEVEL_START_TIME ];
+	if ( currentOffset != cachedLevelStartTimeOffset ) {
+		cachedLevelStartTime = atoi( ctx->cl.gameState.stringData + currentOffset );
+		cachedLevelStartTimeOffset = currentOffset;
+	}
+	return ctx->cl.snap.serverTime - cachedLevelStartTime;
 }

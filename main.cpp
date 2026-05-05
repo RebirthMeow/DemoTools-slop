@@ -25,35 +25,7 @@ extern void system( char * );
 // version 7: added extraction of server ctfstats
 // version 8: bugfix for ctfstats matching
 // version 9: added extraction of machine-readable server ctfstats
-// version 10: added view-angle delta analytics (delta1, bestDeg, etc.)
-// version 11: added mid-air analytics (target_airborne, victim_airtime_ms,
-//             target_z_phase, vertical_delta, target_air_cause,
-//             target_lead_distance, target_dir_changes_during_flight)
-// version 12: fixed flick analytics — snap ring now populated on svc_snapshot
-//             (was on svc_serverCommand, time-irregular and dup-prone) and
-//             pushed for every client (was POV-only).  Added new view fields:
-//             view_flick_window_deg, view_flick_window_ms,
-//             view_flick_window_speed_deg_per_sec — measure the flick INTO
-//             the target (last alignment within FLICK_ALIGN_DEG of attack
-//             line) rather than the post-kill pan.  bestSpd now uses real
-//             serverTime delta instead of a hard-coded 0.033s frame time.
-// version 13: fixed bugs surfaced by the audit:
-//             - target_had_flag now tags every frag by the attacker in the
-//               current snap (was: a single lastFrag pointer that mis-
-//               attributed when the attacker had multiple frags per snap)
-//             - new processEmbeddedPlayerEvents() iterates ET_PLAYER
-//               entityStates each snap and dispatches predictable events
-//               (EV_JUMP, EV_PAIN, EV_FALL) via EV_EVENT_BITS toggle
-//               detection, so target_air_cause now classifies "explosion"
-//               / "jump" / "fall" instead of mostly returning "unknown"
-//             - new fields: target_corpse_path_distance (sum of inter-snap
-//               deltas, for corpses that arc), target_corpse_peak_z_delta
-//               and target_corpse_min_z_delta (signed, vs. firstZ),
-//               target_corpse_z_delta_signed (preserve direction)
-//             - getPlayerMovementLastSecond now skips invalid history
-//               slots instead of terminating, so target_distance_last_second
-//               isn't underestimated for briefly-occluded targets
-const int kSchemaVersion = 13;
+const int kSchemaVersion = 9;
 
 typedef struct info_s {
 	long startTime;
@@ -163,33 +135,6 @@ void makeTeamValueNode( void *allInfo ) {
 	json_object_set_new( ti->info.current, "team", json_string( CG_TeamName( ti->team ) ) );
 }
 
-/* POV-tracking helpers */
-static info_t *getInfoFromPovInfo( void *povInfo ) {
-	return &( (povInfo_t *)povInfo )->info;
-}
-
-qboolean updatePov( void *allInfo, int clientIdx ) {
-	povInfo_t *pi = (povInfo_t *)allInfo;
-	int activePov = ctx->cl.snap.ps.clientNum;      // who we’re looking through
-	if ( clientIdx == activePov ) {
-		if ( pi->info.current == NULL ) {
-			pi->povClient = clientIdx;
-			return qtrue;
-		}
-	} else {
-		if ( pi->info.current != NULL ) {
-			return qtrue;
-		}
-	}
-	return qfalse;
-}
-
-void makePovValueNode( void *allInfo ) {
-	povInfo_t *pi = (povInfo_t *)allInfo;
-	json_object_set_new( pi->info.current, "pov_client", json_integer( pi->povClient ) );
-}
-
-
 static info_t *getInfoFromNewmodInfo( void *newmodInfo ) {
 	return &( (newmodInfo_t *) newmodInfo )->info;
 }
@@ -240,6 +185,27 @@ qboolean updateName( void *allInfo, int clientIdx ) {
 	return qfalse;
 }
 
+/* POV-tracking helpers */
+static info_t* getInfoFromPovInfo(void* povInfo) {
+	return &((povInfo_t*)povInfo)->info;
+}
+
+qboolean updatePov(void* allInfo, int dummy /*unused*/) {
+	povInfo_t* pi = (povInfo_t*)allInfo;
+	int newPov = ctx->cl.snap.ps.clientNum;          // <- the POV in the current snap
+	if (pi->info.current == NULL || newPov != pi->povClient) {
+		pi->povClient = newPov;
+		return qtrue;
+	}
+	return qfalse;
+}
+
+void makePovValueNode(void* allInfo) {
+	povInfo_t* pi = (povInfo_t*)allInfo;
+	json_object_set_new(pi->info.current, "pov_client", json_integer(pi->povClient));
+}
+
+
 #if (defined _MSC_VER)
 #define PRIu64 "I64u"
 #endif
@@ -278,13 +244,6 @@ typedef struct corpseTrack_s {
 	entityState_t firstEntityState;
 	int numSnapsMissing;
 	json_t *frag;
-	// path-integrated travel (sum of per-snap deltas; vs. firstEntityState->lastEntityState
-	// straight-line which can read 0 for a corpse that arcs and lands near origin)
-	float pathDistance;
-	vec3_t prevPos;
-	// peak Z reached, and lowest Z, both relative to firstEntityState.z
-	float peakZAbs;       // max absolute Z observed
-	float minZAbs;        // min absolute Z observed
 } corpseTrack_t;
 corpseTrack_t corpseTrack[MAX_CLIENTS + 8]; // BODY_QUEUE_SIZE
 int corpseTrackIdx = 0;
@@ -296,26 +255,12 @@ void finishCorpse( corpseTrack_t *corpse ) {
 			corpse->firstEntityState.pos.trBase[2] );
 	json_object_set_new( corpse->frag, "target_corpse_travel_distance", json_integer( totalDistance ) );
 	json_object_set_new( corpse->frag, "target_corpse_travel_z_distance", json_integer( zDistance ) );
-
-	// New v13: path-integrated distance (captures arcing trajectories the
-	// straight-line measure misses) + signed peak/min Z deltas (preserve
-	// "did the corpse go up or down" info that the abs() above strips).
-	float firstZ = corpse->firstEntityState.pos.trBase[2];
-	json_object_set_new( corpse->frag, "target_corpse_path_distance",
-		json_integer( (int) corpse->pathDistance ) );
-	json_object_set_new( corpse->frag, "target_corpse_peak_z_delta",
-		json_integer( (int)( corpse->peakZAbs - firstZ ) ) );
-	json_object_set_new( corpse->frag, "target_corpse_min_z_delta",
-		json_integer( (int)( corpse->minZAbs - firstZ ) ) );
-	json_object_set_new( corpse->frag, "target_corpse_z_delta_signed",
-		json_integer( (int)( corpse->lastEntityState.pos.trBase[2] - firstZ ) ) );
 }
 
 typedef struct playerHistory_s {
 	entityState_t es;
 	long frameTime;
 	qboolean valid;
-	float cumDistance;
 } playerHistory_t;
 // minimum frame time is 1msec, so to save 1 second of history we need 1000
 playerHistory_t playerHistory[MAX_CLIENTS][1000];
@@ -323,289 +268,38 @@ int nextPlayerHistoryIdx = 0;
 
 void updateClients( entityState_t **clients, long frameTime ) {
 	for ( int idx = 0; idx < MAX_CLIENTS; idx++ ) {
-		int lastIdx = ( nextPlayerHistoryIdx + 1000 - 1 ) % 1000;
 		if ( clients[idx] != NULL ) {
-			float d = 0.0f;
-			if ( playerHistory[idx][lastIdx].valid ) {
-				d = Distance( playerHistory[idx][lastIdx].es.pos.trBase, clients[idx]->pos.trBase );
-			}
 			playerHistory[idx][nextPlayerHistoryIdx].es = *clients[idx];
 			playerHistory[idx][nextPlayerHistoryIdx].frameTime = frameTime;
 			playerHistory[idx][nextPlayerHistoryIdx].valid = qtrue;
-			playerHistory[idx][nextPlayerHistoryIdx].cumDistance = playerHistory[idx][lastIdx].cumDistance + d;
 		} else {
 			playerHistory[idx][nextPlayerHistoryIdx].valid = qfalse;
-			playerHistory[idx][nextPlayerHistoryIdx].cumDistance = playerHistory[idx][lastIdx].cumDistance;
 		}
 	}
 	nextPlayerHistoryIdx = ( nextPlayerHistoryIdx + 1 ) % 1000;
 }
 
-// ---------------------------------------------------------------------------
-// Mid-air analytics support (UDT-style per-client tracker + trajectory eval)
-// ---------------------------------------------------------------------------
-
-// Sub-snap precision: evaluate a Quake/JKA trajectory at an arbitrary atTime
-// (ms since trTime).  Mirrors OpenJK's BG_EvaluateTrajectory in bg_misc.c.
-// We only need TR_LINEAR / TR_GRAVITY / TR_LINEAR_STOP / TR_SINE; everything
-// else collapses to trBase.
-static void evaluateTrajectory( const trajectory_t *tr, int atTime, vec3_t result ) {
-	float deltaTime;
-	float phase;
-	switch ( tr->trType ) {
-		case TR_STATIONARY:
-		case TR_INTERPOLATE:
-			VectorCopy( tr->trBase, result );
-			break;
-		case TR_LINEAR:
-			deltaTime = ( atTime - tr->trTime ) * 0.001f;
-			VectorMA( tr->trBase, deltaTime, tr->trDelta, result );
-			break;
-		case TR_SINE:
-			deltaTime = ( atTime - tr->trTime ) / (float) tr->trDuration;
-			phase = sinf( deltaTime * (float)M_PI * 2.0f );
-			VectorMA( tr->trBase, phase, tr->trDelta, result );
-			break;
-		case TR_LINEAR_STOP:
-			if ( atTime > tr->trTime + tr->trDuration ) {
-				atTime = tr->trTime + tr->trDuration;
-			}
-			deltaTime = ( atTime - tr->trTime ) * 0.001f;
-			if ( deltaTime < 0.0f ) deltaTime = 0.0f;
-			VectorMA( tr->trBase, deltaTime, tr->trDelta, result );
-			break;
-		case TR_GRAVITY:
-			deltaTime = ( atTime - tr->trTime ) * 0.001f;
-			VectorMA( tr->trBase, deltaTime, tr->trDelta, result );
-			result[2] -= 0.5f * (float)DEFAULT_GRAVITY * deltaTime * deltaTime;
-			break;
-		default:
-			VectorCopy( tr->trBase, result );
-			break;
-	}
-}
-
-// Per-client mid-air tracker.  Updated on every snapshot.  Indexed by clientNum.
-typedef struct playerTrack_s {
-	vec3_t   position;                // last known position (trajectory-evaluated)
-	long     lastUpdateTime;          // serverTime of the last snap we saw this client
-	long     lastGroundContactTime;   // serverTime of the last snap with groundEntityNum != ENTITYNUM_NONE
-	long     lastZDirChangeTime;      // serverTime of the last "forbidden" Z-direction change
-	int      zDir;                    // -1 (descending), 0 (still), +1 (ascending)
-	long     lastJumpTime;            // EV_JUMP fired
-	long     lastJumpPadTime;         // EV_JUMP_PAD fired
-	long     lastFallTime;            // EV_FALL fired (any variant)
-	long     lastPainTime;            // EV_PAIN fired (knockback proxy)
-	long     lastTeleportTime;        // EV_PLAYER_TELEPORT_OUT/IN fired
-} playerTrack_t;
-playerTrack_t playerTrack[MAX_CLIENTS];
-
-// Initialise once at startup.  Called from main().
-static void resetPlayerTrack( void ) {
-	memset( playerTrack, 0, sizeof( playerTrack ) );
-	for ( int idx = 0; idx < MAX_CLIENTS; idx++ ) {
-		playerTrack[idx].lastUpdateTime        = -1;
-		playerTrack[idx].lastGroundContactTime = -1;
-		playerTrack[idx].lastZDirChangeTime    = -1;
-		playerTrack[idx].lastJumpTime          = -1;
-		playerTrack[idx].lastJumpPadTime       = -1;
-		playerTrack[idx].lastFallTime          = -1;
-		playerTrack[idx].lastPainTime          = -1;
-		playerTrack[idx].lastTeleportTime      = -1;
-	}
-}
-
-// Per-snap update.  Mirrors UDT's PlayerInfo update logic: tracks position
-// (trajectory-evaluated for sub-snap accuracy), Z-direction transitions
-// (with only up→still / up→down / still→down considered legitimate
-// continuations of an existing flight), and ground-contact timestamps.
-static void updatePlayerTrack( entityState_t **clients, long frameTime ) {
-	const float kZDirDelta = 1.0f;
-	for ( int idx = 0; idx < MAX_CLIENTS; idx++ ) {
-		entityState_t *es = clients[idx];
-		if ( es == NULL ) continue;
-
-		vec3_t curPos;
-		evaluateTrajectory( &es->pos, frameTime, curPos );
-
-		playerTrack_t *pt = &playerTrack[idx];
-
-		float zChange = curPos[2] - pt->position[2];
-		int oldZDir = pt->zDir;
-		int zDir = 0;
-		if      ( zChange >  kZDirDelta ) zDir = 1;
-		else if ( zChange < -kZDirDelta ) zDir = -1;
-
-		// Allowed continuations of an existing flight:
-		//   up → still, up → down, still → down.
-		// Anything else (still→up, down→up, ...) restarts the airtime clock.
-		bool anyChange       = (zDir != oldZDir);
-		bool upThenStill     = (oldZDir ==  1 && zDir ==  0);
-		bool upThenDown      = (oldZDir ==  1 && zDir == -1);
-		bool stillThenDown   = (oldZDir ==  0 && zDir == -1);
-		bool forbiddenChange = anyChange && !upThenStill && !upThenDown && !stillThenDown;
-
-		VectorCopy( curPos, pt->position );
-		pt->zDir = zDir;
-		if ( zDir == 0 || forbiddenChange || pt->lastUpdateTime < 0 ) {
-			pt->lastZDirChangeTime = frameTime;
-		}
-
-		if ( es->groundEntityNum != ENTITYNUM_NONE ) {
-			pt->lastGroundContactTime = frameTime;
-		}
-		pt->lastUpdateTime = frameTime;
-	}
-}
-
-// Per-snap update of the SnapLite view-angle ring.  Replaces the old
-// svc_serverCommand-based push (which was time-irregular and POV-only).
-// For the local POV we use playerState->viewangles (full yaw/pitch).
-// For other clients we fall back to entityState->apos.trBase — JKA
-// suppresses pitch in the broadcast angles, so for non-POV attackers
-// only yaw is reliable, but it's still better than no data at all.
-static void updateSnapHist( entityState_t **clients, long frameTime,
-                            int povClient, const vec3_t povViewangles ) {
-	for ( int idx = 0; idx < MAX_CLIENTS; idx++ ) {
-		if ( clients[idx] == NULL ) continue;
-		SnapLite s;
-		s.serverTime = frameTime;
-		if ( idx == povClient ) {
-			VectorCopy( povViewangles, s.viewangles );
-		} else {
-			VectorCopy( clients[idx]->apos.trBase, s.viewangles );
-		}
-		auto &ring = g_snapHist[ idx ];
-		// guard against duplicate pushes for the same serverTime (should be rare
-		// post-fix, but cheap insurance).
-		if ( !ring.empty() && ring.back().serverTime == frameTime ) {
-			ring.back() = s;
-		} else {
-			ring.push_back( s );
-		}
-		if ( ring.size() > SNAP_KEEP ) ring.pop_front();
-	}
-}
-
-// Detect predictable events embedded on player entityStates (EV_JUMP, EV_PAIN,
-// EV_FALL, EV_JUMP_PAD, EV_PLAYER_TELEPORT_IN/OUT — these arrive on the
-// player's own entityState, NOT as free-standing temp entities, so the
-// existing event switch never sees them).  JKA flips EV_EVENT_BITS whenever
-// a new event is added, so we detect new events by tracking those bits.
-static int g_lastPlayerEventBits[MAX_CLIENTS];
-
-static void resetPlayerEventBits( void ) {
-	for ( int i = 0; i < MAX_CLIENTS; i++ ) {
-		g_lastPlayerEventBits[i] = -1;     // -1 = unseen, fires on first valid event
-	}
-}
-
-static void processEmbeddedPlayerEvents( entityState_t **clients, long frameTime ) {
-	for ( int idx = 0; idx < MAX_CLIENTS; idx++ ) {
-		entityState_t *es = clients[idx];
-		if ( es == NULL ) continue;
-		int curBits  = es->event & EV_EVENT_BITS;
-		int curEvent = es->event & ~EV_EVENT_BITS;
-		if ( curEvent == 0 ) continue;                  // no event encoded
-		if ( curBits == g_lastPlayerEventBits[idx] ) continue;  // bits unchanged
-		g_lastPlayerEventBits[idx] = curBits;
-
-		switch ( curEvent ) {
-			case EV_JUMP:               playerTrack[idx].lastJumpTime     = frameTime; break;
-			case EV_FALL:               playerTrack[idx].lastFallTime     = frameTime; break;
-			case EV_PAIN:               playerTrack[idx].lastPainTime     = frameTime; break;
-			case EV_JUMP_PAD:           playerTrack[idx].lastJumpPadTime  = frameTime; break;
-			case EV_PLAYER_TELEPORT_IN:
-			case EV_PLAYER_TELEPORT_OUT: playerTrack[idx].lastTeleportTime = frameTime; break;
-			default: break;
-		}
-	}
-}
-
-// Look up the player's history entry closest to (and not after) atTime.
-// Returns NULL if no usable entry exists.  Used to recover target position
-// at rocket-launch time for lead-distance / direction-change features.
-static playerHistory_t *findPlayerHistoryAt( int playerIdx, long atTime ) {
-	int low = 0;
-	int high = 999;
-	int bestIdx = -1;
-
-	// Binary search for the largest frameTime <= atTime.
-	// playerHistory is a circular buffer where nextPlayerHistoryIdx is the oldest.
-	while ( low <= high ) {
-		int mid = ( low + high ) / 2;
-		int realIdx = ( nextPlayerHistoryIdx + mid ) % 1000;
-		if ( playerHistory[playerIdx][realIdx].frameTime <= atTime ) {
-			bestIdx = mid;
-			low = mid + 1;
-		} else {
-			high = mid - 1;
-		}
-	}
-
-	if ( bestIdx == -1 ) {
-		return NULL;
-	}
-
-	// We found the closest timestamp <= atTime. Now walk backwards to find the
-	// closest VALID entry within a reasonable window (1000ms).
-	for ( int i = bestIdx; i >= 0 && i > bestIdx - 100; i-- ) {
-		int realIdx = ( nextPlayerHistoryIdx + i ) % 1000;
-		playerHistory_t *ph = &playerHistory[playerIdx][realIdx];
-		if ( !ph->valid ) continue;
-		long delta = atTime - ph->frameTime;
-		if ( delta < 0 ) continue; // should not happen with binary search logic
-		if ( delta < 1000 ) return ph;
-		break; // outside 1s window
-	}
-
-	return NULL;
-}
-
-// computes the distance the given player moved in the last second.
-// Skips invalid slots (player briefly off-snap / occluded) instead of
-// terminating, so a target who flickered in/out of PVS still gets an
-// accurate last-second total.
+// computes the distance the given player moved in the last second
 float getPlayerMovementLastSecond( int playerIdx, long frameTime ) {
-	long startTime = frameTime - 1000;
-	if ( startTime < 0 ) startTime = 0;
-
-	int endIdx = ( nextPlayerHistoryIdx + 1000 - 1 ) % 1000;
-	float endDist = playerHistory[playerIdx][endIdx].cumDistance;
-
-	// Binary search for the first VALID history slot at or after startTime.
-	int low = 0;
-	int high = 999;
-	int bestIdx = -1;
-
-	while ( low <= high ) {
-		int mid = ( low + high ) / 2;
-		int realIdx = ( nextPlayerHistoryIdx + mid ) % 1000;
-		if ( playerHistory[playerIdx][realIdx].frameTime >= startTime ) {
-			bestIdx = mid;
-			high = mid - 1;
-		} else {
-			low = mid + 1;
+	float totalDistance = 0;
+	vec3_t *nextPos = NULL;
+	for ( int currentIdx = ( nextPlayerHistoryIdx + 1000 - 1 ) % 1000;
+			currentIdx != nextPlayerHistoryIdx &&
+				playerHistory[playerIdx][currentIdx].valid == qtrue &&
+				( frameTime - playerHistory[playerIdx][currentIdx].frameTime ) < 1000;
+			currentIdx = ( currentIdx + 1000 - 1 ) % 1000 ) {
+		if ( nextPos != NULL ) {
+			totalDistance += Distance( *nextPos, playerHistory[playerIdx][currentIdx].es.pos.trBase );
 		}
+		nextPos = &playerHistory[playerIdx][currentIdx].es.pos.trBase;
 	}
-
-	if ( bestIdx == -1 ) {
-		return 0.0f;
-	}
-
-	int startIdx = ( nextPlayerHistoryIdx + bestIdx ) % 1000;
-	// We want the cumulative distance accumulated BETWEEN ph[startIdx] and ph[endIdx].
-	// ph[startIdx].cumDistance includes distance up to that frame.
-	// So we return endDist - startDist.
-	return endDist - playerHistory[playerIdx][startIdx].cumDistance;
+	return totalDistance;
 }
 
 entityState_t makerEnts[MAX_GENTITIES];
 
 int main( int argc, char **argv ) {
 	memset( playerHistory, 0, sizeof( playerHistory ) );
-	resetPlayerTrack();
-	resetPlayerEventBits();
 	cl_shownet->integer = 0;
 	//printf( "JKDemoMetadata v" VERSION " loaded\n");
 	if ( argc < 2 ) {
@@ -677,19 +371,6 @@ int main( int argc, char **argv ) {
 	clientTeamsTrack.getInfo = getInfoFromTeamInfo;
 	clientTeamsTrack.makeValueNode = makeTeamValueNode;
 
-	povInfo_t povInfos[MAX_CLIENTS];
-	memset( povInfos, 0, sizeof( povInfos ) );
-
-	clientInfoTrack_t povTrack;
-	povTrack.allInfos = &povInfos;
-	povTrack.infoSize = sizeof( *povInfos );
-	povTrack.keyPrefix = "pov";
-	povTrack.rootNode = NULL;
-	povTrack.changed = updatePov;
-	povTrack.getInfo = getInfoFromPovInfo;
-	povTrack.makeValueNode = makePovValueNode;
-
-
 	json_t *maps = json_array();
 	json_object_set( root, "maps", maps );
 
@@ -741,16 +422,19 @@ int main( int argc, char **argv ) {
 		/*if (cl.snap.serverTime == 1626964134) {
 			printf("at bad time");
 		}*/
-		// process any new server commands to update configstrings/serverId
-		for (; ctx->clc.lastExecutedServerCommand <= ctx->clc.serverCommandSequence; ctx->clc.lastExecutedServerCommand++ ) {
-			char *command = ctx->clc.serverCommands[ ctx->clc.lastExecutedServerCommand & ( MAX_RELIABLE_COMMANDS - 1 ) ];
+		// jump ahead to resolve a new serverId as we need to know if it changed before doing anything
+		const char *systemInfo = ctx->cl.gameState.stringData + ctx->cl.gameState.stringOffsets[ CS_SYSTEMINFO ];
+		int start = Q_max( ctx->clc.lastExecutedServerCommand, ctx->clc.serverCommandSequence - MAX_RELIABLE_COMMANDS + 1 );
+		ctx->clc.lastExecutedServerCommand = start;
+		for (int cmdIdx = start; cmdIdx <= ctx->clc.serverCommandSequence; cmdIdx++ ) {
+			char *command = ctx->clc.serverCommands[ cmdIdx & ( MAX_RELIABLE_COMMANDS - 1 ) ];
 			Cmd_TokenizeString( command );
 			char *cmd = Cmd_Argv( 0 );
 			if ( !strcmp( cmd, "cs" ) ) {
 				CL_ConfigstringModified();
+				systemInfo = ctx->cl.gameState.stringData + ctx->cl.gameState.stringOffsets[ CS_SYSTEMINFO ];
 			}
 		}
-		const char *systemInfo = ctx->cl.gameState.stringData + ctx->cl.gameState.stringOffsets[ CS_SYSTEMINFO ];
 		ctx->cl.serverId = atoi( Info_ValueForKey( systemInfo, "sv_serverid" ) );
 		qboolean trashCurrentMap = qfalse;
 		if ( previousSnapshot.valid && ctx->cl.snap.serverTime < previousSnapshot.serverTime ) {
@@ -766,7 +450,6 @@ int main( int argc, char **argv ) {
 			finishClientInfo( &clientTeamsTrack, previousTime, previousSnapshot.serverTime );
 			finishClientInfo( &clientNamesTrack, previousTime, previousSnapshot.serverTime );
 			finishClientInfo( &clientNewmodTrack, previousTime, previousSnapshot.serverTime );
-			finishClientInfo( &povTrack, previousTime, previousSnapshot.serverTime );
 
 			if ( map != NULL ) {
 				json_object_set_new( map, "map_end_time", json_integer( previousTime ) );
@@ -780,7 +463,21 @@ int main( int argc, char **argv ) {
 
 			// if we didn't receive yet the new gamestate, skip this snap
 			if (previousSnapshot.valid && ctx->cl.serverId == previousServerId) {
-				continue;
+				// need to still process commands for map_restart to reset the serverid
+				// process any new server commands
+				for ( ; ctx->clc.lastExecutedServerCommand <= ctx->clc.serverCommandSequence && ctx->cl.serverId == previousServerId; ctx->clc.lastExecutedServerCommand++ ) {
+					char *command = ctx->clc.serverCommands[ ctx->clc.lastExecutedServerCommand & ( MAX_RELIABLE_COMMANDS - 1 ) ];
+					Cmd_TokenizeString( command );
+					char *cmd = Cmd_Argv( 0 );
+					if ( !strcmp( cmd, "cs" ) ) {
+						CL_ConfigstringModified();
+						systemInfo = ctx->cl.gameState.stringData + ctx->cl.gameState.stringOffsets[ CS_SYSTEMINFO ];
+						ctx->cl.serverId = atoi( Info_ValueForKey( systemInfo, "sv_serverid" ) );
+					}
+				}
+				if (ctx->cl.serverId == previousServerId) {
+					continue;
+				}
 			}
 			previousServerId = ctx->cl.serverId;
 			map = json_object();
@@ -801,8 +498,6 @@ int main( int argc, char **argv ) {
 			json_object_set( map, "teams", clientTeamsTrack.rootNode );
 			clientNewmodTrack.rootNode = json_object();
 			json_object_set( map, "newmod", clientNewmodTrack.rootNode );
-			povTrack.rootNode = json_object();
-			json_object_set( map, "pov", povTrack.rootNode );
 			if ( frags != NULL ) {
 				json_decref( frags );
 			}
@@ -1263,7 +958,6 @@ int main( int argc, char **argv ) {
 		updateClientInfo( &clientNewmodTrack );
 		updateClientInfo( &clientNamesTrack );
 		updateClientInfo( &clientTeamsTrack );
-		updateClientInfo( &povTrack );
 		if ( !mapStartTimeInitialized ) {
 			json_object_set_new( map, "map_start_time", json_integer( getCurrentTime() ) );
 			json_object_set_new( map, "map_start_time_raw", json_integer( ctx->cl.snap.serverTime ) );
@@ -1277,420 +971,354 @@ int main( int argc, char **argv ) {
 		entityState_t *clientEnts[MAX_CLIENTS];
 		entityState_t me;
 		memset( clientEnts, 0, sizeof( clientEnts ) );
-		BG_PlayerStateToEntityState( &ctx->cl.snap.ps, &me, qfalse );
-		clientEnts[me.number] = &me;
-
 		for ( int entityIdx = 0; entityIdx < ctx->cl.snap.numEntities; entityIdx++ ) {
 			entityState_t *es = &ctx->cl.parseEntities[( ctx->cl.snap.parseEntitiesNum + entityIdx ) & (MAX_PARSE_ENTITIES-1)];
-			
-			// Map client entities
 			if ( es->number >= 0 && es->number < MAX_CLIENTS ) {
 				clientEnts[es->number] = es;
 			}
-
-			// Process events
+		}
+		BG_PlayerStateToEntityState( &ctx->cl.snap.ps, &me, qfalse );
+		clientEnts[me.number] = &me;
+		updateClients( clientEnts, ctx->cl.snap.serverTime );
+		for ( int corpseIdx = 0; corpseIdx < corpseTrackIdx; corpseIdx++ ) {
+			corpseTrack[corpseIdx].numSnapsMissing++;
+		}
+		for ( int entityIdx = 0; entityIdx < ctx->cl.snap.numEntities; entityIdx++ ) {
+			entityState_t *es = &ctx->cl.parseEntities[( ctx->cl.snap.parseEntitiesNum + entityIdx ) & (MAX_PARSE_ENTITIES-1)];
 			if ( es->eType > ET_EVENTS ) {
 				es->event = es->eType - ET_EVENTS;
-				if ( eventReceived[es->number] < ctx->cl.snap.serverTime - EVENT_VALID_MSEC ) {
-					eventReceived[es->number] = ctx->cl.snap.serverTime;
-					// ---- mid-air analytics: stamp per-client airtime causes ----
-					if ( es->number >= 0 && es->number < MAX_CLIENTS ) {
-						switch ( es->event ) {
-							case EV_JUMP:               playerTrack[es->number].lastJumpTime     = ctx->cl.snap.serverTime; break;
-							case EV_JUMP_PAD:           playerTrack[es->number].lastJumpPadTime  = ctx->cl.snap.serverTime; break;
-							case EV_FALL:               playerTrack[es->number].lastFallTime     = ctx->cl.snap.serverTime; break;
-							case EV_PAIN:               playerTrack[es->number].lastPainTime     = ctx->cl.snap.serverTime; break;
-							case EV_PLAYER_TELEPORT_IN:
-							case EV_PLAYER_TELEPORT_OUT: playerTrack[es->number].lastTeleportTime = ctx->cl.snap.serverTime; break;
-							default: break;
-						}
-					}
-					switch( es->event ) {
-						case EV_OBITUARY: {
-							int target = es->otherEntityNum;
-							int attacker = es->otherEntityNum2;
-							int mod = es->eventParm;
-							long millis = getCurrentTime();
-							long seconds = millis / 1000;
-							/* Inside EV_OBITUARY, before we allocate the frag object */
-							if (attacker == ctx->cl.snap.ps.clientNum && mod != MOD_SUICIDE) {
-								json_t *frag = json_object();
-								json_object_set_new( frag, "pov_client", json_integer( ctx->cl.snap.ps.clientNum ) );
-								lastFrag[ attacker ] = frag;
-								json_object_set_new( frag, "time", json_integer( getCurrentTime() ) );
-								json_object_set_new( frag, "time_raw", json_integer( ctx->cl.snap.serverTime ) );
-								json_object_set_new( frag, "human_time", json_string(
-									va( "%02d:%02d:%02d.%03d", seconds / 60 / 60, (seconds / 60) % 60, seconds % 60, millis % 1000 ) ) );
-								json_object_set_new( frag, "attacker", json_integer( attacker ) );
-								json_object_set_new( frag, "attacker_name", json_string( getPlayerNameUTF8( attacker ) ) );
-								json_object_set_new( frag, "attacker_team", json_string( getPlayerTeamName( attacker ) ) );
-								json_object_set_new( frag, "attacker_is_bot", json_integer( playerSkill( attacker ) == -1 ? 0 : 1 ) );
-								json_object_set_new( frag, "target", json_integer( target ) );
-								json_object_set_new( frag, "target_name", json_string( getPlayerNameUTF8( target ) ) );
-								json_object_set_new( frag, "target_team", json_string( getPlayerTeamName( target ) ) );
-								json_object_set_new( frag, "target_is_bot", json_integer( playerSkill( target ) == -1 ? 0 : 1 ) );
-								json_object_set_new( frag, "target_had_flag", json_integer( 0 ) );
-								json_object_set_new( frag, "mod", json_integer( mod ) );
-								json_object_set_new( frag, "mod_name", json_string( modNames[mod] ) );
-								/* ---- view-angle delta analytics ---- */
-								float delta1  = 0.0f;
-								float speed1  = 0.0f;
-								float bestDeg = 0.0f;
-								float bestSpd = 0.0f;
-								auto &ring = g_snapHist[ attacker ];
-								if ( ring.size() >= 2 ) {
-									const SnapLite &cur  = ring.back();
-									const SnapLite &prev = ring[ ring.size() - 2 ];
-									float dYaw   = AngleDelta( prev.viewangles[YAW],   cur.viewangles[YAW] );
-									float dPitch = AngleDelta( prev.viewangles[PITCH], cur.viewangles[PITCH] );
-									delta1 = sqrt( dYaw*dYaw + dPitch*dPitch );
-									int msec = cur.serverTime - prev.serverTime;
-									speed1 = (msec > 0) ? delta1 / msec : 0.0f;
-									size_t lookBack = std::min<size_t>( 4, ring.size() - 1 );
-									int    bestSpanMs = 33;
-									for ( size_t k = 1; k <= lookBack; ++k ) {
-										const SnapLite &older = ring[ ring.size() - 1 - k ];
-										float dYawK   = AngleDelta( older.viewangles[YAW],   cur.viewangles[YAW] );
-										float dPitchK = AngleDelta( older.viewangles[PITCH], cur.viewangles[PITCH] );
-										float degK    = sqrt( dYawK*dYawK + dPitchK*dPitchK );
-										if ( degK > bestDeg ) {
-											bestDeg    = degK;
-											bestSpanMs = cur.serverTime - older.serverTime;
-										}
-									}
-									bestSpd = (bestSpanMs > 0) ? ( bestDeg * 1000.0f / (float) bestSpanMs ) : 0.0f;
-								}
-								const int FLICK_LOOKBACK_MS = 250;
-								float flickDeg    = 0.0f;
-								int   flickWindMs = 0;
-								float flickSpd    = 0.0f;
-								if ( ring.size() >= 2 ) {
-									const SnapLite &cur2 = ring.back();
-									long minTime = cur2.serverTime - FLICK_LOOKBACK_MS;
-									for ( int k = (int) ring.size() - 2; k >= 0; k-- ) {
-										const SnapLite &older = ring[k];
-										if ( older.serverTime < minTime ) break;
-										float dYawF   = AngleDelta( older.viewangles[YAW],   cur2.viewangles[YAW] );
-										float dPitchF = AngleDelta( older.viewangles[PITCH], cur2.viewangles[PITCH] );
-										float deg     = sqrt( dYawF*dYawF + dPitchF*dPitchF );
-										if ( deg > flickDeg ) {
-											flickDeg    = deg;
-											flickWindMs = cur2.serverTime - older.serverTime;
-										}
-									}
-									if ( flickWindMs > 0 ) {
-										flickSpd = flickDeg * 1000.0f / (float) flickWindMs;
-									}
-								}
-								int flickAlignMs = -1;
-								if ( ring.size() >= 2 && attacker < MAX_CLIENTS && target < MAX_CLIENTS &&
-									clientEnts[attacker] && clientEnts[target] ) {
-									vec3_t attackLine;
-									VectorSubtract( clientEnts[target]->pos.trBase, clientEnts[attacker]->pos.trBase, attackLine );
-									float aLen = VectorLength( attackLine );
-									if ( aLen > 1.0f ) {
-										VectorScale( attackLine, 1.0f / aLen, attackLine );
-										const float kCosAlign = 0.99f;
-										const SnapLite &cur3 = ring.back();
-										long minTime = cur3.serverTime - FLICK_LOOKBACK_MS;
-										flickAlignMs = 0;
-										for ( int k = (int) ring.size() - 2; k >= 0; k-- ) {
-											const SnapLite &older = ring[k];
-											if ( older.serverTime < minTime ) break;
-											vec3_t viewDir, ang;
-											VectorCopy( older.viewangles, ang );
-											AngleVectors( ang, viewDir, NULL, NULL );
-											float dot = viewDir[0]*attackLine[0] + viewDir[1]*attackLine[1] + viewDir[2]*attackLine[2];
-											if ( dot < kCosAlign ) {
-												flickAlignMs = cur3.serverTime - older.serverTime;
-												break;
-											}
-										}
-									}
-								}
-								json_object_set_new( frag, "view_delta_deg",               json_real( delta1 ) );
-								json_object_set_new( frag, "view_speed_deg_per_ms",        json_real( speed1 ) );
-								json_object_set_new( frag, "view_best_delta_deg",          json_real( bestDeg ) );
-								json_object_set_new( frag, "view_best_speed_deg_per_sec",  json_real( bestSpd ) );
-								json_object_set_new( frag, "view_flick_window_deg",            json_real( flickDeg ) );
-								json_object_set_new( frag, "view_flick_window_ms",             json_integer( flickWindMs ) );
-								json_object_set_new( frag, "view_flick_window_speed_deg_per_sec", json_real( flickSpd ) );
-								json_object_set_new( frag, "view_flick_align_ms",              json_integer( flickAlignMs ) );
-								json_array_append( frags, frag );
-								if ( ctx->clc.clientNum == attacker && ctx->clc.clientNum != target && mod != MOD_SUICIDE ) {
-									json_array_append( ownfrags, frag );
-								}
-								if ( attacker < MAX_CLIENTS && target < MAX_CLIENTS && clientEnts[attacker] && clientEnts[target] ) {
-									json_object_set_new( frag, "attacker_target_distance",
-										json_integer( (int) Distance( clientEnts[attacker]->pos.trBase, clientEnts[target]->pos.trBase ) ) );
-								}
-								if ( attacker < MAX_CLIENTS && clientEnts[attacker] ) {
-									vec3_t clippedDelta;
-									VectorCopy( clientEnts[attacker]->pos.trDelta, clippedDelta );
-									int zSpeed = (int) abs( clippedDelta[2] );
-									clippedDelta[2] = 0;
-									float speed = VectorLength( clippedDelta );
-									json_object_set_new( frag, "attacker_xy_speed", json_integer( (int) speed ) );
-									json_object_set_new( frag, "attacker_z_speed", json_integer( zSpeed ) );
-									float lastSecondDistance = getPlayerMovementLastSecond( attacker, ctx->cl.snap.serverTime );
-									json_object_set_new( frag, "attacker_distance_last_second", json_integer( (int) lastSecondDistance ) );
-								}
-								if ( target < MAX_CLIENTS && clientEnts[target] ) {
-									vec3_t clippedDelta;
-									VectorCopy( clientEnts[target]->pos.trDelta, clippedDelta );
-									int zSpeed = (int) abs( clippedDelta[2] );
-									clippedDelta[2] = 0;
-									float speed = VectorLength( clippedDelta );
-									json_object_set_new( frag, "target_xy_speed", json_integer( (int) speed ) );
-									json_object_set_new( frag, "target_z_speed", json_integer( zSpeed ) );
-									float lastSecondDistance = getPlayerMovementLastSecond( target, ctx->cl.snap.serverTime );
-									json_object_set_new( frag, "target_distance_last_second", json_integer( (int) lastSecondDistance ) );
-									if ( corpseTrackIdx >= sizeof( corpseTrack ) / sizeof( *corpseTrack ) ) {
-										Com_Error( ERR_FATAL, "Corpse track overflow" );
-									}
-									if ( clientEnts[target]->eFlags & EF_DEAD ) {
-										corpseTrack[corpseTrackIdx].frag = frag;
-										corpseTrack[corpseTrackIdx].lastEntityState = *clientEnts[target];
-										corpseTrack[corpseTrackIdx].firstEntityState = *clientEnts[target];
-										corpseTrack[corpseTrackIdx].number = target;
-										corpseTrack[corpseTrackIdx].numSnapsMissing = 0;
-										corpseTrack[corpseTrackIdx].pathDistance = 0.0f;
-										VectorCopy( clientEnts[target]->pos.trBase, corpseTrack[corpseTrackIdx].prevPos );
-										corpseTrack[corpseTrackIdx].peakZAbs = clientEnts[target]->pos.trBase[2];
-										corpseTrack[corpseTrackIdx].minZAbs  = clientEnts[target]->pos.trBase[2];
-										corpseTrackIdx++;
-									}
-									{
-										playerTrack_t *tt = &playerTrack[target];
-										long now = ctx->cl.snap.serverTime;
-										bool airborne = ( clientEnts[target]->groundEntityNum == ENTITYNUM_NONE );
-										json_object_set_new( frag, "target_airborne", json_integer( airborne ? 1 : 0 ) );
-										long victimAirtime = 0;
-										if ( airborne && tt->lastZDirChangeTime >= 0 ) {
-											victimAirtime = now - tt->lastZDirChangeTime;
-											if ( victimAirtime < 0 ) victimAirtime = 0;
-										}
-										json_object_set_new( frag, "victim_airtime_ms", json_integer( (int) victimAirtime ) );
-										int zVel = (int) clientEnts[target]->pos.trDelta[2];
-										const char *zPhase = "ground";
-										if ( airborne ) {
-											if      ( zVel >  20 ) zPhase = "ascending";
-											else if ( zVel < -20 ) zPhase = "falling";
-											else                   zPhase = "apex";
-										}
-										json_object_set_new( frag, "target_z_phase", json_string( zPhase ) );
-										int vDelta = 0;
-										if ( attacker < MAX_CLIENTS && clientEnts[attacker] ) {
-											vDelta = (int)( clientEnts[target]->pos.trBase[2] - clientEnts[attacker]->pos.trBase[2] );
-										}
-										json_object_set_new( frag, "vertical_delta", json_integer( vDelta ) );
-										if ( airborne && attacker < MAX_CLIENTS && clientEnts[attacker] ) {
-											vec3_t attackLine, tVel;
-											VectorSubtract( clientEnts[target]->pos.trBase, clientEnts[attacker]->pos.trBase, attackLine );
-											VectorCopy( clientEnts[target]->pos.trDelta, tVel );
-											float aLen = VectorLength( attackLine );
-											float vLen = VectorLength( tVel );
-											if ( aLen > 1.0f && vLen > 1.0f ) {
-												float dot = ( attackLine[0]*tVel[0] + attackLine[1]*tVel[1] + attackLine[2]*tVel[2] ) / ( aLen * vLen );
-												if ( dot >  1.0f ) dot =  1.0f;
-												if ( dot < -1.0f ) dot = -1.0f;
-												json_object_set_new( frag, "target_crossing_dot", json_real( dot ) );
-											}
-										}
-										const char *cause = "unknown";
-										if ( airborne ) {
-											long causeWin = 1500;
-											long jpAge   = (tt->lastJumpPadTime >= 0) ? (now - tt->lastJumpPadTime) : -1;
-											long painAge = (tt->lastPainTime    >= 0) ? (now - tt->lastPainTime   ) : -1;
-											long jumpAge = (tt->lastJumpTime    >= 0) ? (now - tt->lastJumpTime   ) : -1;
-											long fallAge = (tt->lastFallTime    >= 0) ? (now - tt->lastFallTime   ) : -1;
-											long telAge  = (tt->lastTeleportTime>= 0) ? (now - tt->lastTeleportTime): -1;
-											if      ( telAge  >= 0 && telAge  <= causeWin ) cause = "teleport";
-											else if ( jpAge   >= 0 && jpAge   <= causeWin ) cause = "jumppad";
-											else if ( painAge >= 0 && painAge <= causeWin ) cause = "explosion";
-											else if ( jumpAge >= 0 && jumpAge <= causeWin ) cause = "jump";
-											else if ( fallAge >= 0 && fallAge <= causeWin ) cause = "fall";
-										}
-										json_object_set_new( frag, "target_air_cause", json_string( cause ) );
-									}
-								}
-								switch ( mod ) {
-									case MOD_ROCKET:
-									case MOD_BRYAR_PISTOL:
-									case MOD_BRYAR_PISTOL_ALT:
-									case MOD_BOWCASTER:
-									case MOD_CONC:
-									case MOD_CONC_ALT:
-									case MOD_DEMP2:
-									case MOD_FLECHETTE:
-									case MOD_REPEATER:
-									case MOD_REPEATER_ALT:
-									case MOD_THERMAL: {
-										weapon_t weapon = WP_NONE;
-										switch ( mod ) {
-											case MOD_ROCKET: weapon = WP_ROCKET_LAUNCHER; break;
-											case MOD_BRYAR_PISTOL:
-											case MOD_BRYAR_PISTOL_ALT: weapon = WP_BRYAR_PISTOL; break;
-											case MOD_BOWCASTER: weapon = WP_BOWCASTER; break;
-											case MOD_CONC:
-											case MOD_CONC_ALT: weapon = WP_CONCUSSION; break;
-											case MOD_DEMP2: weapon = WP_DEMP2; break;
-											case MOD_FLECHETTE: weapon = WP_FLECHETTE; break;
-											case MOD_REPEATER:
-											case MOD_REPEATER_ALT: weapon = WP_REPEATER; break;
-											case MOD_THERMAL: weapon = WP_THERMAL; break;
-										}
-										entityState_t *missile = NULL;
-										for ( int rIdx = 0; rIdx < ctx->cl.snap.numEntities; rIdx++ ) {
-											entityState_t *ers = &ctx->cl.parseEntities[( ctx->cl.snap.parseEntitiesNum + rIdx ) & (MAX_PARSE_ENTITIES-1)];
-											if ( ers->eType == ET_GENERAL && ( ers->event & ~EV_EVENT_BITS ) == EV_MISSILE_HIT && ers->otherEntityNum == target && ers->weapon == weapon) {
-												missile = ers; break;
-											}
-										}
-										if ( missile != NULL ) {
-											firstMissile_t *firstMissile = &firstMissiles[missile->number];
-											if ( firstMissile->es.number == missile->number ) {
-												json_object_set_new( frag, "missile_lifetime", json_integer( ctx->cl.snap.serverTime - firstMissile->snapTime ) );
-												if ( mod == MOD_ROCKET && firstMissile->numDirectionChanges > 2 && firstMissile->numDirectionChanges >= firstMissile->numFrames / 2 ) {
-													json_object_set_new( frag, "mod", json_integer( MOD_ROCKET_HOMING ) );
-													json_object_set_new( frag, "mod_name", json_string( modNames[MOD_ROCKET_HOMING] ) );
-												}
-												if ( target < MAX_CLIENTS && clientEnts[target] ) {
-													long fireTime = firstMissile->snapTime;
-													playerHistory_t *atFire = findPlayerHistoryAt( target, fireTime );
-													if ( atFire != NULL ) {
-														vec3_t targetAtFire, targetAtHit;
-														evaluateTrajectory( &atFire->es.pos, atFire->frameTime, targetAtFire );
-														evaluateTrajectory( &clientEnts[target]->pos, ctx->cl.snap.serverTime, targetAtHit );
-														int leadDist = (int) Distance( targetAtFire, targetAtHit );
-														json_object_set_new( frag, "target_lead_distance", json_integer( leadDist ) );
-														int dirChanges = 0;
-														float prevXdir = 0.0f, prevYdir = 0.0f;
-														int havePrev = 0;
-														for ( int k = 0; k < 1000; k++ ) {
-															playerHistory_t *ph = &playerHistory[target][k];
-															if ( !ph->valid ) continue;
-															if ( ph->frameTime < fireTime ) continue;
-															if ( ph->frameTime > ctx->cl.snap.serverTime ) continue;
-															float vx = ph->es.pos.trDelta[0], vy = ph->es.pos.trDelta[1];
-															float vMag = sqrtf( vx*vx + vy*vy );
-															if ( vMag < 1.0f ) continue;
-															float xd = vx / vMag, yd = vy / vMag;
-															if ( havePrev ) {
-																float dot = xd*prevXdir + yd*prevYdir;
-																if ( dot < 0.0f ) dirChanges++;
-															}
-															prevXdir = xd; prevYdir = yd; havePrev = 1;
-														}
-														json_object_set_new( frag, "target_dir_changes_during_flight", json_integer( dirChanges ) );
-													}
-												}
-												entityState_t *lastMissile = &lastMissiles[missile->number];
-												if ( lastMissile->number == missile->number && lastMissile->pos.trType != TR_STATIONARY ) {
-													vec3_t vdir; vectoangles( firstMissile->es.pos.trDelta, vdir );
-													if ( vdir[PITCH] < -180 ) vdir[PITCH] += 360;
-													json_object_set_new( frag, "missile_pitch", json_integer( -vdir[PITCH] ) );
-												}
-											}
-										}
-										break;
-									}
-									default: break;
-								}
-							}
-							break;
-						}
-						case EV_CTFMESSAGE: {
-							int clIndex = es->trickedentindex;
-							team_t teamIndex = (team_t) es->trickedentindex2;
-							int ctfMessage = es->eventParm;
-							json_t *ctfevent = json_object();
-							json_object_set_new( ctfevent, "time", json_integer( getCurrentTime() ) );
-							json_object_set_new( ctfevent, "time_raw", json_integer( ctx->cl.snap.serverTime ) );
-							long millis = getCurrentTime();
-							long seconds = millis / 1000;
-							json_object_set_new( ctfevent, "human_time", json_string(
-								va( "%02d:%02d:%02d.%03d", seconds / 60 / 60, (seconds / 60) % 60, seconds % 60, millis % 1000 ) ) );
-							switch (ctfMessage)
+				if ( eventReceived[es->number] >= ctx->cl.snap.serverTime - EVENT_VALID_MSEC ) {
+					// debounce it
+					continue;
+				}
+				eventReceived[es->number] = ctx->cl.snap.serverTime;
+				//Com_Printf( "Event %d fired\n", es->event );
+				switch( es->event ) {
+					case EV_OBITUARY: {
+						int target = es->otherEntityNum;
+						int attacker = es->otherEntityNum2;
+						int mod = es->eventParm;
+						long millis = getCurrentTime();
+						long seconds = millis / 1000;
+						//Com_Printf( "At time %02d:%02d:%02d.%03d, client %s killed client %s by %s\n",
+						//	seconds / 60 / 60, (seconds / 60) % 60, seconds % 60, cl.snap.serverTime % 1000,
+						//	getPlayerName( attacker ), getPlayerName( target ), modNames[mod] );
+						json_t *frag = json_object();
+						//Com_Printf( "frag: %x\n", (int) frag );
+						lastFrag[ attacker ] = frag;
+						json_object_set_new( frag, "time", json_integer( getCurrentTime() ) );
+						json_object_set_new( frag, "time_raw", json_integer( ctx->cl.snap.serverTime ) );
+						json_object_set_new( frag, "human_time", json_string(
+							va( "%02d:%02d:%02d.%03d", seconds / 60 / 60, (seconds / 60) % 60, seconds % 60, millis % 1000 ) ) );
+						json_object_set_new( frag, "attacker", json_integer( attacker ) );
+						json_object_set_new( frag, "attacker_name", json_string( getPlayerNameUTF8( attacker ) ) );
+						json_object_set_new( frag, "attacker_team", json_string( getPlayerTeamName( attacker ) ) );
+						json_object_set_new( frag, "attacker_is_bot", json_integer( playerSkill( attacker ) == -1 ? 0 : 1 ) );
+						json_object_set_new( frag, "target", json_integer( target ) );
+						json_object_set_new( frag, "target_name", json_string( getPlayerNameUTF8( target ) ) );
+						json_object_set_new( frag, "target_team", json_string( getPlayerTeamName( target ) ) );
+						json_object_set_new( frag, "target_is_bot", json_integer( playerSkill( target ) == -1 ? 0 : 1 ) );
+						json_object_set_new( frag, "target_had_flag", json_integer( 0 ) );
+						json_object_set_new( frag, "mod", json_integer( mod ) );
+						json_object_set_new( frag, "mod_name", json_string( modNames[mod] ) );
+											/* ---- view-angle delta analytics ---- */
+												/* ---- view-angle delta analytics ---- */
+						float delta1  = 0.0f;        // one-frame delta   – what you had before
+						float speed1  = 0.0f;        // one-frame speed
+						float bestDeg = 0.0f;        // UDT-style max over 4 frames
+						float bestSpd = 0.0f;        // bestDeg converted to deg / s
+
+						auto &ring = g_snapHist[ attacker ];     // attacker == POV for ownfrags
+
+						if ( ring.size() >= 2 )
+						{
+							/* 1) single-frame delta (prev vs cur) ---------------------------- */
+							const SnapLite &cur  = ring.back();
+							const SnapLite &prev = ring[ ring.size() - 2 ];
+
+							float dYaw   = AngleDelta( prev.viewangles[YAW],   cur.viewangles[YAW] );
+							float dPitch = AngleDelta( prev.viewangles[PITCH], cur.viewangles[PITCH] );
+							delta1 = std::sqrt( dYaw*dYaw + dPitch*dPitch );
+
+							int msec = cur.serverTime - prev.serverTime;          // ~25–33 ms
+							speed1 = (msec > 0) ? delta1 / msec : 0.0f;           // deg / ms
+
+							/* 2) multi-frame “best” delta over last 4 frames (UDT style) ----- */
+							size_t lookBack = std::min<size_t>( 4, ring.size() - 1 );
+							for ( size_t k = 1; k <= lookBack; ++k )
 							{
-							case CTFMESSAGE_FRAGGED_FLAG_CARRIER:
-								if ( clIndex < MAX_CLIENTS && frags != NULL ) {
-									long obitTime = ctx->cl.snap.serverTime;
-									for ( int fi = (int) json_array_size( frags ) - 1; fi >= 0; fi-- ) {
-										json_t *fragX = json_array_get( frags, fi );
-										if ( !fragX ) break;
-										json_t *jt = json_object_get( fragX, "time_raw" );
-										if ( !jt ) break;
-										long fragTime = (long) json_integer_value( jt );
-										if ( fragTime != obitTime ) break;
-										json_t *ja = json_object_get( fragX, "attacker" );
-										if ( ja && (int) json_integer_value( ja ) == clIndex ) {
-											json_object_set_new( fragX, "target_had_flag", json_integer( 1 ) );
+								const SnapLite &older = ring[ ring.size() - 1 - k ];
+								float dYawK   = AngleDelta( older.viewangles[YAW],   cur.viewangles[YAW] );
+								float dPitchK = AngleDelta( older.viewangles[PITCH], cur.viewangles[PITCH] );
+								float degK    = std::sqrt( dYawK*dYawK + dPitchK*dPitchK );
+								bestDeg = std::max( bestDeg, degK );
+							}
+							bestSpd = bestDeg / 0.033f;   // convert to ≈ deg / s (assume 33 ms)
+						}
+
+						/* 3) store in JSON --------------------------------------------------- */
+						json_object_set_new( frag, "view_delta_deg",               json_real( delta1 ) );
+						json_object_set_new( frag, "view_speed_deg_per_ms",        json_real( speed1 ) );
+						json_object_set_new( frag, "view_best_delta_deg",          json_real( bestDeg ) );
+						json_object_set_new( frag, "view_best_speed_deg_per_sec",  json_real( bestSpd ) );
+
+
+						json_array_append( frags, frag );
+						if ( ctx->clc.clientNum == attacker && ctx->clc.clientNum != target && mod != MOD_SUICIDE ) {
+							// skip selfkills and suicide grants
+							json_array_append( ownfrags, frag );
+						}
+						// search for attacker distance to target
+						if ( attacker < MAX_CLIENTS && target < MAX_CLIENTS &&
+								clientEnts[attacker] && clientEnts[target] ) {
+							// we have both players in this snap, so we can figure out the distance
+							json_object_set_new( frag, "attacker_target_distance",
+								json_integer( (int) Distance( clientEnts[attacker]->pos.trBase, clientEnts[target]->pos.trBase ) ) );
+						}
+						if ( attacker < MAX_CLIENTS && clientEnts[attacker] ) {
+							vec3_t clippedDelta;
+							VectorCopy( clientEnts[attacker]->pos.trDelta, clippedDelta );
+							int zSpeed = (int) abs( clippedDelta[2] );
+							clippedDelta[2] = 0;
+							float speed = VectorLength( clippedDelta );
+							json_object_set_new( frag, "attacker_xy_speed",
+									json_integer( (int) speed ) );
+							json_object_set_new( frag, "attacker_z_speed",
+									json_integer( zSpeed ) );
+							float lastSecondDistance = getPlayerMovementLastSecond( attacker, ctx->cl.snap.serverTime );
+							json_object_set_new( frag, "attacker_distance_last_second",
+									json_integer( (int) lastSecondDistance ) );
+						}
+						if ( target < MAX_CLIENTS && clientEnts[target] ) {
+							vec3_t clippedDelta;
+							VectorCopy( clientEnts[target]->pos.trDelta, clippedDelta );
+							int zSpeed = (int) abs( clippedDelta[2] );
+							clippedDelta[2] = 0;
+							float speed = VectorLength( clippedDelta );
+							json_object_set_new( frag, "target_xy_speed",
+									json_integer( (int) speed ) );
+							json_object_set_new( frag, "target_z_speed",
+									json_integer( zSpeed ) );
+							float lastSecondDistance = getPlayerMovementLastSecond( target, ctx->cl.snap.serverTime );
+							json_object_set_new( frag, "target_distance_last_second",
+									json_integer( (int) lastSecondDistance ) );
+							if ( corpseTrackIdx >= sizeof( corpseTrack ) / sizeof( *corpseTrack ) ) {
+								Com_Error( ERR_FATAL, "Corpse track overflow" );
+							}
+							if ( clientEnts[target]->eFlags & EF_DEAD ) {
+								corpseTrack[corpseTrackIdx].frag = frag;
+								corpseTrack[corpseTrackIdx].lastEntityState = *clientEnts[target];
+								corpseTrack[corpseTrackIdx].firstEntityState = *clientEnts[target];
+								corpseTrack[corpseTrackIdx].number = target;
+								corpseTrack[corpseTrackIdx].numSnapsMissing = 0;
+								corpseTrackIdx++;
+							}
+						}
+						switch ( mod ) {
+						case MOD_ROCKET:
+						case MOD_BRYAR_PISTOL:
+						case MOD_BRYAR_PISTOL_ALT:
+						case MOD_BOWCASTER:
+						case MOD_CONC:
+						case MOD_CONC_ALT:
+						case MOD_DEMP2:
+						case MOD_FLECHETTE:
+						case MOD_REPEATER:
+						case MOD_REPEATER_ALT:
+						case MOD_THERMAL:
+						{
+							weapon_t weapon = WP_NONE;
+							switch ( mod ) {
+								case MOD_ROCKET:
+									weapon = WP_ROCKET_LAUNCHER;
+									break;
+								case MOD_BRYAR_PISTOL:
+								case MOD_BRYAR_PISTOL_ALT:
+									weapon = WP_BRYAR_PISTOL;
+									break;
+								case MOD_BOWCASTER:
+									weapon = WP_BOWCASTER;
+									break;
+								case MOD_CONC:
+								case MOD_CONC_ALT:
+									weapon = WP_CONCUSSION;
+									break;
+								case MOD_DEMP2:
+									weapon = WP_DEMP2;
+									break;
+								case MOD_FLECHETTE:
+									weapon = WP_FLECHETTE;
+									break;
+								case MOD_REPEATER:
+								case MOD_REPEATER_ALT:
+									weapon = WP_REPEATER;
+									break;
+								case MOD_THERMAL:
+									weapon = WP_THERMAL;
+									break;
+							}
+							// try and find the rocket
+							entityState_t *missile = NULL;
+							for ( int rocketIdx = 0; rocketIdx < ctx->cl.snap.numEntities; rocketIdx++ ) {
+								entityState_t *es = &ctx->cl.parseEntities[( ctx->cl.snap.parseEntitiesNum + rocketIdx ) & (MAX_PARSE_ENTITIES-1)];
+								if ( es->eType == ET_GENERAL &&
+										( es->event & ~EV_EVENT_BITS ) == EV_MISSILE_HIT &&
+										es->otherEntityNum == target &&
+										es->weapon == weapon) {
+									// this missile just hit the target
+									missile = es;
+									break;
+								}
+							}
+							if ( missile != NULL ) {
+								//Com_Printf( "Found the missile: %d\n", missile->number );
+								firstMissile_t *firstMissile = &firstMissiles[missile->number];
+								if ( firstMissile->es.number == missile->number ) {
+									//Com_Printf( "Found the initial missile: %d\n", firstMissile->es.number );
+									json_object_set_new( frag, "missile_lifetime",
+										json_integer( ctx->cl.snap.serverTime - firstMissile->snapTime ) );
+									if ( mod == MOD_ROCKET &&
+											firstMissile->numDirectionChanges > 2 &&
+											firstMissile->numDirectionChanges >= firstMissile->numFrames / 2 ) {
+										// rocket bug - the ent is recorded as primary but it's really homing
+										json_object_set_new( frag, "mod", json_integer( MOD_ROCKET_HOMING ) );
+										json_object_set_new( frag, "mod_name", json_string( modNames[MOD_ROCKET_HOMING] ) );
+									}
+									entityState_t *lastMissile = &lastMissiles[missile->number];
+									// use the missile from 1 previous frame to get pitch, for gravity affected trajectories
+									if ( lastMissile->number == missile->number &&
+										lastMissile->pos.trType != TR_STATIONARY ) {
+										// can record the angle of elevation (pitch)
+										vec3_t dir;
+										vectoangles( firstMissile->es.pos.trDelta, dir );
+										if ( dir[PITCH] < -180 ) {
+											dir[PITCH] += 360;
 										}
+										// theoretically, pitch should now be between -90 (stright down) and +90 (straight up)
+										json_object_set_new( frag, "missile_pitch",
+											json_integer( -dir[PITCH] ) );
 									}
 								}
-								json_object_set_new( ctfevent, "eventtype", json_string( "FRAGGED_FLAG_CARRIER" ) );
-								json_object_set_new( ctfevent, "attacker", json_integer( clIndex ) );
-								json_object_set_new( ctfevent, "attacker_name", json_string( getPlayerNameUTF8( clIndex ) ) );
-								json_object_set_new( ctfevent, "team", json_string( CG_TeamName( OtherTeam( teamIndex ) ) ) );
-								break;
-							case CTFMESSAGE_FLAG_RETURNED:
-								json_object_set_new( ctfevent, "eventtype", json_string( "FLAG_RETURNED" ) );
-								json_object_set_new( ctfevent, "team", json_string( CG_TeamName( teamIndex ) ) );
-								break;
-							case CTFMESSAGE_PLAYER_RETURNED_FLAG:
-								json_object_set_new( ctfevent, "eventtype", json_string( "PLAYER_RETURNED_FLAG" ) );
-								json_object_set_new( ctfevent, "attacker", json_integer( clIndex ) );
-								json_object_set_new( ctfevent, "attacker_name", json_string( getPlayerNameUTF8( clIndex ) ) );
-								json_object_set_new( ctfevent, "team", json_string( CG_TeamName( teamIndex ) ) );
-								break;
-							case CTFMESSAGE_PLAYER_CAPTURED_FLAG:
-								json_object_set_new( ctfevent, "eventtype", json_string( "PLAYER_CAPTURED_FLAG" ) );
-								json_object_set_new( ctfevent, "attacker", json_integer( clIndex ) );
-								json_object_set_new( ctfevent, "attacker_name", json_string( getPlayerNameUTF8( clIndex ) ) );
-								json_object_set_new( ctfevent, "team", json_string( CG_TeamName( teamIndex ) ) );
-								break;
-							case CTFMESSAGE_PLAYER_GOT_FLAG:
-								json_object_set_new( ctfevent, "eventtype", json_string( "PLAYER_GOT_FLAG" ) );
-								json_object_set_new( ctfevent, "attacker", json_integer( clIndex ) );
-								json_object_set_new( ctfevent, "attacker_name", json_string( getPlayerNameUTF8( clIndex ) ) );
-								json_object_set_new( ctfevent, "team", json_string( CG_TeamName( teamIndex ) ) );
-								break;
-							default: break;
 							}
-							json_array_append_new( ctfevents, ctfevent );
 							break;
 						}
-						default: break;
+						default:
+							break;
+						}
+						break;
 					}
+					case EV_CTFMESSAGE: {
+						int clIndex = es->trickedentindex;
+						team_t teamIndex = (team_t) es->trickedentindex2;
+						int ctfMessage = es->eventParm;
+						json_t *ctfevent = json_object();
+						json_object_set_new( ctfevent, "time", json_integer( getCurrentTime() ) );
+						json_object_set_new( ctfevent, "time_raw", json_integer( ctx->cl.snap.serverTime ) );
+						long millis = getCurrentTime();
+						long seconds = millis / 1000;
+						json_object_set_new( ctfevent, "human_time", json_string(
+							va( "%02d:%02d:%02d.%03d", seconds / 60 / 60, (seconds / 60) % 60, seconds % 60, millis % 1000 ) ) );
+						switch (ctfMessage)
+						{
+						case CTFMESSAGE_FRAGGED_FLAG_CARRIER:
+							//Com_Printf("Player %s fragged the %s flag carrier\n", getPlayerName( clIndex ), CG_TeamName( OtherTeam( teamIndex ) ) );
+							if ( clIndex < MAX_CLIENTS && lastFrag[ clIndex ] != NULL ) {
+								//TODO: this may be incorrect if attacker had multiple frags in one frame
+								json_object_set_new( lastFrag[ clIndex ], "target_had_flag", json_integer( 1 ) );
+							}
+							json_object_set_new( ctfevent, "eventtype", json_string( "FRAGGED_FLAG_CARRIER" ) );
+							json_object_set_new( ctfevent, "attacker", json_integer( clIndex ) );
+							json_object_set_new( ctfevent, "attacker_name", json_string( getPlayerNameUTF8( clIndex ) ) );
+							json_object_set_new( ctfevent, "team", json_string( CG_TeamName( OtherTeam( teamIndex ) ) ) );
+							break;
+						case CTFMESSAGE_FLAG_RETURNED:
+							//Com_Printf("%s flag was returned\n", CG_TeamName( teamIndex ) );
+							json_object_set_new( ctfevent, "eventtype", json_string( "FLAG_RETURNED" ) );
+							json_object_set_new( ctfevent, "team", json_string( CG_TeamName( teamIndex ) ) );
+							break;
+						case CTFMESSAGE_PLAYER_RETURNED_FLAG:
+							//Com_Printf("Player %s returned the %s flag\n", getPlayerName( clIndex ), CG_TeamName( teamIndex ) );
+							json_object_set_new( ctfevent, "eventtype", json_string( "PLAYER_RETURNED_FLAG" ) );
+							json_object_set_new( ctfevent, "attacker", json_integer( clIndex ) );
+							json_object_set_new( ctfevent, "attacker_name", json_string( getPlayerNameUTF8( clIndex ) ) );
+							json_object_set_new( ctfevent, "team", json_string( CG_TeamName( teamIndex ) ) );
+							break;
+						case CTFMESSAGE_PLAYER_CAPTURED_FLAG:
+							//Com_Printf("Player %s captured the %s flag\n", getPlayerName( clIndex ), CG_TeamName( teamIndex ) );
+							json_object_set_new( ctfevent, "eventtype", json_string( "PLAYER_CAPTURED_FLAG" ) );
+							json_object_set_new( ctfevent, "attacker", json_integer( clIndex ) );
+							json_object_set_new( ctfevent, "attacker_name", json_string( getPlayerNameUTF8( clIndex ) ) );
+							json_object_set_new( ctfevent, "team", json_string( CG_TeamName( teamIndex ) ) );
+							break;
+						case CTFMESSAGE_PLAYER_GOT_FLAG:
+							//Com_Printf("Player %s got the %s flag\n", getPlayerName( clIndex ), CG_TeamName( teamIndex ) );
+							json_object_set_new( ctfevent, "eventtype", json_string( "PLAYER_GOT_FLAG" ) );
+							json_object_set_new( ctfevent, "attacker", json_integer( clIndex ) );
+							json_object_set_new( ctfevent, "attacker_name", json_string( getPlayerNameUTF8( clIndex ) ) );
+							json_object_set_new( ctfevent, "team", json_string( CG_TeamName( teamIndex ) ) );
+							break;
+						default:
+							break;
+						}
+						json_array_append_new( ctfevents, ctfevent );
+						break;
+					}
+					default:
+						break;
 				}
 			} else if ( ( es->eType == ET_BODY || es->eType == ET_PLAYER ) && ( es->eFlags & EF_DEAD ) ) {
 				for ( int corpseIdx = 0; corpseIdx < corpseTrackIdx; corpseIdx++ ) {
 					if ( corpseTrack[corpseIdx].number == es->number ) {
+						// update it
 						corpseTrack[corpseIdx].numSnapsMissing = 0;
 						corpseTrack[corpseIdx].lastEntityState = *es;
-						corpseTrack[corpseIdx].pathDistance += Distance( corpseTrack[corpseIdx].prevPos, es->pos.trBase );
-						VectorCopy( es->pos.trBase, corpseTrack[corpseIdx].prevPos );
-						if ( es->pos.trBase[2] > corpseTrack[corpseIdx].peakZAbs ) corpseTrack[corpseIdx].peakZAbs = es->pos.trBase[2];
-						if ( es->pos.trBase[2] < corpseTrack[corpseIdx].minZAbs )  corpseTrack[corpseIdx].minZAbs  = es->pos.trBase[2];
 					}
 				}
 			}
-
+		}
+		for ( int corpseIdx = 0; corpseIdx < corpseTrackIdx; corpseIdx++ ) {
+			if ( ( corpseTrack[corpseIdx].numSnapsMissing > 1 || corpseTrack[corpseIdx].number == -1 ) ||
+					corpseTrack[corpseIdx].lastEntityState.pos.trType == TR_STATIONARY ) {
+				finishCorpse( &corpseTrack[corpseIdx] );
+				corpseTrack[corpseIdx] = corpseTrack[corpseTrackIdx - 1];
+				corpseTrackIdx--;
+				corpseIdx--; // should reprocess it now
+				continue;
+			}
+		}
+		memset( lastMissiles, 0, sizeof( lastMissiles ) );
+		for ( int rocketIdx = 0; rocketIdx < ctx->cl.snap.numEntities; rocketIdx++ ) {
+			entityState_t *es = &ctx->cl.parseEntities[( ctx->cl.snap.parseEntitiesNum + rocketIdx ) & (MAX_PARSE_ENTITIES-1)];
 			if ( parseMakerEnts ) {
 				if ( ( es->eType == ET_MOVER && es->modelindex && es->modelindex2 ) || es->eType == ET_FX ) {
+					// see if it already exists in our list
 					qboolean exists = qfalse;
 					for (int searchIdx = 1; searchIdx < MAX_GENTITIES; searchIdx++) {
-						if (makerEnts[searchIdx].number == 0) break;
-						if (VectorCompare(makerEnts[searchIdx].origin, es->origin) && makerEnts[searchIdx].eType == es->eType && makerEnts[searchIdx].modelindex == es->modelindex && makerEnts[searchIdx].userInt1 != ctx->cl.snap.serverTime) {
+						if (makerEnts[searchIdx].number == 0) {
+							// ents are allocated contiguiously
+							break;
+						}
+						if (VectorCompare(makerEnts[searchIdx].origin, es->origin) &&
+								makerEnts[searchIdx].eType == es->eType &&
+								makerEnts[searchIdx].modelindex == es->modelindex &&
+								makerEnts[searchIdx].userInt1 != ctx->cl.snap.serverTime) {
 							exists = qtrue;
-							if (es->eType == ET_FX) { es->userInt1 = ctx->cl.snap.serverTime; es->userInt2 = es->userInt1 - makerEnts[searchIdx].userInt1; }
-							makerEnts[searchIdx] = *es; break;
+							if (es->eType == ET_FX) {
+								es->userInt1 = ctx->cl.snap.serverTime;
+								es->userInt2 = es->userInt1 - makerEnts[searchIdx].userInt1;
+							}
+							makerEnts[searchIdx] = *es;
+							break;
 						}
 					}
 					if (!exists) {
+						// copy it to an unused location
 						for (int unusedIdx = 1; unusedIdx < MAX_GENTITIES; unusedIdx++) {
-							if (makerEnts[unusedIdx].number == 0) { makerEnts[unusedIdx] = *es; break; }
+							if (makerEnts[unusedIdx].number == 0) {
+								// slot is unused
+								makerEnts[unusedIdx] = *es;
+								break;
+							}
 						}
 					}
 				}
@@ -1698,15 +1326,6 @@ int main( int argc, char **argv ) {
 			if ( es->eType == ET_MISSILE) {
 				lastMissiles[es->number] = *es;
 			}
-		}
-
-		updateClients( clientEnts, ctx->cl.snap.serverTime );
-		updatePlayerTrack( clientEnts, ctx->cl.snap.serverTime );
-		updateSnapHist( clientEnts, ctx->cl.snap.serverTime,
-			ctx->cl.snap.ps.clientNum, ctx->cl.snap.ps.viewangles );
-		processEmbeddedPlayerEvents( clientEnts, ctx->cl.snap.serverTime );
-		for ( int corpseIdx = 0; corpseIdx < corpseTrackIdx; corpseIdx++ ) {
-			corpseTrack[corpseIdx].numSnapsMissing++;
 		}
 		for ( int rocketIdx = 0; rocketIdx < sizeof( lastMissiles ) / sizeof( *lastMissiles ); rocketIdx++ ) {
 			if ( firstMissiles[rocketIdx].es.number == 0 && lastMissiles[rocketIdx].number != 0 ) {

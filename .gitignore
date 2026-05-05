@@ -9,3 +9,10 @@
 *.vcxproj.filters
 ipch/
 *.suo
+.vs/
+.vscode/
+*.exe
+diff.txt
+*.json
+*.dm_meta
+old exe/
